@@ -1,8 +1,10 @@
+import asyncio
+
 import village.config as cfg
 from village.types import AgentConfig, AgentState, RunState
 from typing import List
 
-def build_agents() -> list[AgentState]:
+async def build_agents() -> list[AgentState]:
     agents: List[AgentState] = []
 
     for agent_cfg in cfg.AGENTS:
@@ -11,12 +13,14 @@ def build_agents() -> list[AgentState]:
         if missing_keys:
             raise ValueError(f"Agent config is missing keys: {missing_keys}. Got: {list(agent_cfg.keys())}")
 
-        agents.append(AgentState(config=AgentConfig(**agent_cfg)))
+        agent = AgentState(config=AgentConfig(**agent_cfg))
+        await agent.launch_browser()
+        agents.append(agent)
 
     return agents
 
-def create_run_state(goal: str) -> RunState:
-    agents = build_agents()
+async def create_run_state(goal: str) -> RunState:
+    agents = await build_agents()
 
     return RunState(
         goal = goal, 
