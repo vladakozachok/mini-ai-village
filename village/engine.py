@@ -50,7 +50,7 @@ def _set_coordination_field(message: str, key: str, value: str) -> str:
     return f"{replacement}\n{message}".strip()
 
 
-def latest_coordination_by_agent(state: RunState) -> dict[str, dict[str, str]]:
+def last_messages_for_each_agent(state: RunState) -> dict[str, dict[str, str]]:
     latest: dict[str, dict[str, str]] = {}
     for msg in reversed(list(state.messages)):
         if msg.speaker in latest:
@@ -65,7 +65,7 @@ def find_active_intent_owner(state: RunState, intent: str, exclude_agent: str) -
     if not intent:
         return None
 
-    latest = latest_coordination_by_agent(state)
+    latest = last_messages_for_each_agent(state)
     normalized_intent = intent.strip().lower()
 
     for speaker, fields in latest.items():
@@ -96,7 +96,7 @@ def _get_intent_key_from_fields(fields: dict[str, str]) -> str:
 def find_active_intent_owner_by_key(state: RunState, intent_key: str, exclude_agent: str) -> str | None:
     if not intent_key:
         return None
-    latest = latest_coordination_by_agent(state)
+    latest = last_messages_for_each_agent(state)
     for speaker, fields in latest.items():
         if speaker == exclude_agent:
             continue
@@ -108,7 +108,7 @@ def find_active_intent_owner_by_key(state: RunState, intent_key: str, exclude_ag
 
 
 def build_coordination_summary(state: RunState) -> str:
-    latest = latest_coordination_by_agent(state)
+    latest = last_messages_for_each_agent(state)
     if not latest:
         return "COORDINATION SUMMARY: none yet."
 
@@ -127,14 +127,106 @@ def build_coordination_summary(state: RunState) -> str:
     return "\n".join(lines)
 
 
+def _truncate_value(value: str, limit: int = 180) -> str:
+    value = (value or "").strip()
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 3)] + "..."
+
+
+def _compact_memory_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    recent_events = []
+    for event in (snapshot.get("recent_events") or [])[-4:]:
+        if not isinstance(event, dict):
+            continue
+        recent_events.append(
+            {
+                "agent": event.get("agent", ""),
+                "event_type": event.get("event_type", ""),
+                "intent": event.get("intent", ""),
+                "turn": event.get("turn", 0),
+            }
+        )
+
+    active_intents = {}
+    for key, value in list((snapshot.get("active_intents") or {}).items())[:6]:
+        if not isinstance(value, dict):
+            continue
+        active_intents[key] = {
+            "owner": value.get("owner", ""),
+            "status": value.get("status", ""),
+            "expires_at_turn": value.get("expires_at_turn", 0),
+        }
+
+    dependencies = []
+    for dep in (snapshot.get("dependencies") or [])[:6]:
+        if not isinstance(dep, dict):
+            continue
+        dependencies.append(
+            {
+                "from_agent": dep.get("from_agent", ""),
+                "to_agent": dep.get("to_agent", ""),
+                "intent": dep.get("intent", ""),
+                "reason": _truncate_value(str(dep.get("reason", "")), 100),
+            }
+        )
+
+    artifacts = {}
+    for key, value in list((snapshot.get("artifacts") or {}).items())[:8]:
+        if not isinstance(value, dict):
+            continue
+        artifacts[key] = {
+            "intent": value.get("intent", ""),
+            "value": _truncate_value(str(value.get("value", "")), 120),
+            "by_agent": value.get("by_agent", ""),
+            "turn": value.get("turn", 0),
+        }
+
+    blockers = {}
+    for key, value in list((snapshot.get("blockers") or {}).items())[:6]:
+        if not isinstance(value, dict):
+            continue
+        blockers[key] = {
+            "intent": value.get("intent", ""),
+            "type": value.get("type", ""),
+            "by_agent": value.get("by_agent", ""),
+            "description": _truncate_value(str(value.get("description", "")), 100),
+        }
+
+    recent_failures = dict(list((snapshot.get("recent_failures") or {}).items())[:6])
+
+    return {
+        "summary": snapshot.get("summary", ""),
+        "active_intents": active_intents,
+        "done_intents": snapshot.get("done_intents", {}),
+        "dependencies": dependencies,
+        "artifacts": artifacts,
+        "blockers": blockers,
+        "recent_failures": recent_failures,
+        "last_status_by_agent": snapshot.get("last_status_by_agent", {}),
+        "recent_events": recent_events,
+    }
+
+
 def build_input_text(state: RunState, agent: AgentState, observation: dict) -> str:
     summary = build_coordination_summary(state)
-    memory_snapshot = state.memory.get_snapshot()
+    memory_snapshot = _compact_memory_snapshot(state.memory.get_snapshot())
+    last_actions, last_results = agent.get_last_action()
 
     lines = []
     lines.append(f"GOAL: {state.goal}\n")
-    lines.append(f"{summary}\n\n")
+    lines.append(f"LATEST MESSAGES SUMMARY: {summary}\n\n")
     lines.append(f"MEMORY_SNAPSHOT: {json.dumps(memory_snapshot)}\n\n")
+    if last_actions:
+        compact_last = []
+        for action, result in list(zip(last_actions, last_results))[-2:]:
+            state_changed = None
+            if isinstance(result.data, dict):
+                state_changed = result.data.get("state_changed")
+            compact_last.append(
+                f"{action.type.value}:success={result.success},state_changed={state_changed},error={_truncate_value(result.error_message or 'none', 80)}"
+            )
+        lines.append(f"LAST_ACTION_RESULT: {' | '.join(compact_last)}\n\n")
     lines.append(f"BROWSER OBSERVATION: \n{observation}\n")
 
     return "".join(lines)
@@ -320,6 +412,19 @@ def _last_agent_fields(state: RunState, agent_name: str) -> dict[str, str]:
     return {}
 
 
+def _is_verification_only_actions(actions: list[Action]) -> bool:
+    if not actions:
+        return True
+    return all(action.type.value == "get_value" for action in actions)
+
+
+def _is_low_impact_actions(actions: list[Action]) -> bool:
+    if not actions:
+        return True
+    low_impact_types = {"get_value", "type", "keypress"}
+    return all(action.type.value in low_impact_types for action in actions)
+
+
 def _last_agent_had_no_action_in_progress(state: RunState, agent_name: str) -> bool:
     for message in reversed(state.messages):
         if message.speaker != agent_name:
@@ -330,8 +435,90 @@ def _last_agent_had_no_action_in_progress(state: RunState, agent_name: str) -> b
         status = fields.get("STATUS", "").strip().lower()
         if status != "in_progress":
             return False
-        return not message.actions
+        return _is_verification_only_actions(message.actions)
     return False
+
+
+def _consecutive_verification_turns_for_intent(state: RunState, agent_name: str, intent_key: str) -> int:
+    if not intent_key:
+        return 0
+    count = 0
+    for message in reversed(state.messages):
+        if message.speaker != agent_name:
+            continue
+        fields = parse_coordination_fields(message.message)
+        if not fields:
+            continue
+        if _get_intent_key_from_fields(fields) != intent_key:
+            break
+        status = fields.get("STATUS", "").strip().lower()
+        if status != "in_progress":
+            break
+        if _is_verification_only_actions(message.actions):
+            count += 1
+            continue
+        break
+    return count
+
+
+def _consecutive_same_low_impact_plan_for_intent(
+    state: RunState,
+    agent_name: str,
+    intent_key: str,
+    current_actions: list[Action],
+) -> int:
+    if not intent_key or not _is_low_impact_actions(current_actions):
+        return 0
+    current_sig = [_action_signature(a) for a in current_actions]
+    count = 0
+    for message in reversed(state.messages):
+        if message.speaker != agent_name:
+            continue
+        fields = parse_coordination_fields(message.message)
+        if not fields:
+            continue
+        if _get_intent_key_from_fields(fields) != intent_key:
+            break
+        if fields.get("STATUS", "").strip().lower() != "in_progress":
+            break
+        if not _is_low_impact_actions(message.actions):
+            break
+        prev_sig = [_action_signature(a) for a in message.actions]
+        if prev_sig != current_sig:
+            break
+        count += 1
+    return count
+
+
+def _has_actionable_elements(observation: dict) -> bool:
+    elements = observation.get("elements", [])
+    if not isinstance(elements, list):
+        return False
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        if el.get("kind") != "interactive":
+            continue
+        if el.get("disabled"):
+            continue
+        if el.get("selector"):
+            return True
+    return False
+
+
+def _observation_fingerprint(observation: dict) -> tuple[str, str, str]:
+    if not isinstance(observation, dict):
+        return "", "", ""
+    title = _normalize_text(str(observation.get("title", "")))
+    focused = _normalize_text(str(observation.get("focused_text", "")))
+    visible = _normalize_text(str(observation.get("visible_text", "")))
+    return title[:200], focused[:240], visible[:240]
+
+
+def _has_meaningful_observation_delta(before_obs: dict, after_obs: dict) -> bool:
+    before = _observation_fingerprint(before_obs)
+    after = _observation_fingerprint(after_obs)
+    return before != after
 
 
 def _dependency_is_resolved(state: RunState, dep: Dependency) -> bool:
@@ -385,16 +572,70 @@ def _is_wait_dependency_resolved(state: RunState, target_agent: str) -> bool:
     return False
 
 
+def _is_needed_by_waiting_peer(state: RunState, agent_name: str) -> bool:
+    latest = last_messages_for_each_agent(state)
+    for speaker, fields in latest.items():
+        if speaker == agent_name:
+            continue
+        status = fields.get("STATUS", "").strip().lower()
+        if status != "waiting":
+            continue
+        needs = fields.get("NEEDS", "")
+        if not _is_none_like(needs) and agent_name.lower() in needs.lower():
+            return True
+    return False
+
+
+def _mentioned_agents_in_needs(state: RunState, needs: str) -> list[str]:
+    lowered = needs.lower()
+    mentioned = [agent.name for agent in state.agents if agent.name.lower() in lowered]
+    # Stable/deterministic ordering for tie-breaks.
+    return sorted(set(mentioned))
+
+
+def _deadlock_breaker_target_agent(state: RunState) -> str | None:
+    # Prefer unresolved dependency targets first.
+    unresolved_targets: list[str] = []
+    for dep in state.memory.dependencies:
+        if _dependency_is_resolved(state, dep):
+            continue
+        unresolved_targets.append(dep.to_agent)
+    if unresolved_targets:
+        counts: dict[str, int] = {}
+        for agent in unresolved_targets:
+            counts[agent] = counts.get(agent, 0) + 1
+        # Most-blocked target first; stable tie-break by name.
+        return sorted(counts.keys(), key=lambda name: (-counts[name], name))[0]
+
+    # Look at the most recent coordination message with a concrete NEEDS field.
+    for msg in reversed(state.messages):
+        fields = parse_coordination_fields(msg.message)
+        if not fields:
+            continue
+        needs = fields.get("NEEDS", "")
+        if _is_none_like(needs):
+            continue
+        mentioned = _mentioned_agents_in_needs(state, needs)
+        if len(mentioned) == 1:
+            return mentioned[0]
+        if len(mentioned) > 1:
+            # If both/many are mentioned, nudge one at a time (deterministic alternation).
+            idx = state.next_turn % len(mentioned)
+            return mentioned[idx]
+    return None
+
+
 def _should_break_wait_deadlock(state: RunState, agent_name: str) -> bool:
-    if state.memory.active_intents:
-        return False
     statuses = state.memory.last_status_by_agent
     if not statuses:
         return False
     if not all(status == "waiting" for status in statuses.values()):
         return False
-    # Deterministic leader: alphabetically smallest agent name proceeds.
-    leader = sorted(statuses.keys())[0]
+    # Prefer the target requested by the most recent NEEDS message.
+    leader = _deadlock_breaker_target_agent(state)
+    if not leader:
+        # Fallback: alphabetically smallest waiting agent proceeds.
+        leader = sorted(statuses.keys())[0]
     return agent_name == leader
 
 
@@ -539,6 +780,15 @@ async def run_agent_cycle(state: RunState, agent: AgentState) -> Message:
                 "NEXT",
                 "Proceed with the next concrete step for this intent.",
             )
+        if claimed_status == "waiting" and _is_needed_by_waiting_peer(state, agent.name):
+            claimed_status = "in_progress"
+            message_text = _set_coordination_field(message_text, "STATUS", "in_progress")
+            message_text = _set_coordination_field(message_text, "NEEDS", "none")
+            message_text = _set_coordination_field(
+                message_text,
+                "NEXT",
+                "Another agent is waiting on you; perform a concrete action now.",
+            )
         if claimed_status == "waiting" and _should_break_wait_deadlock(state, agent.name):
             claimed_status = "in_progress"
             message_text = _set_coordination_field(message_text, "STATUS", "in_progress")
@@ -549,11 +799,79 @@ async def run_agent_cycle(state: RunState, agent: AgentState) -> Message:
                 "Deadlock breaker: proceed with the next concrete step.",
             )
         actions = extract_actions(response)
+        needed_by_waiting_peer = _is_needed_by_waiting_peer(state, agent.name)
+        verification_only_actions = _is_verification_only_actions(actions)
+        consecutive_verification_turns = _consecutive_verification_turns_for_intent(
+            state=state,
+            agent_name=agent.name,
+            intent_key=claimed_intent_key,
+        )
+        has_actionable_elements = _has_actionable_elements(observation)
+        same_low_impact_repeats = _consecutive_same_low_impact_plan_for_intent(
+            state=state,
+            agent_name=agent.name,
+            intent_key=claimed_intent_key,
+            current_actions=actions,
+        )
         if (
             attempt == 0
             and claimed_status == "in_progress"
             and _is_none_like(claimed_needs)
-            and not actions
+            and has_actionable_elements
+            and verification_only_actions
+            and consecutive_verification_turns >= cfg.MAX_CONSECUTIVE_VERIFICATION_TURNS
+        ):
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    generate_response_fn,
+                    model=agent.model,
+                    instructions=agent.system_prompt,
+                    input_text=input_text
+                    + "\nENFORCEMENT: Verification-only cap reached. Perform at least one concrete UI action now (prefer click_index).",
+                ),
+                timeout=cfg.LLM_TIMEOUT_SECONDS,
+            )
+            continue
+        if (
+            attempt == 0
+            and claimed_status == "in_progress"
+            and needed_by_waiting_peer
+            and _is_low_impact_actions(actions)
+        ):
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    generate_response_fn,
+                    model=agent.model,
+                    instructions=agent.system_prompt,
+                    input_text=input_text
+                    + "\nENFORCEMENT: Another agent is waiting on you. Take a concrete UI action now (not just monitoring/chat/get_value).",
+                ),
+                timeout=cfg.LLM_TIMEOUT_SECONDS,
+            )
+            continue
+        if (
+            attempt == 0
+            and claimed_status == "in_progress"
+            and _is_none_like(claimed_needs)
+            and has_actionable_elements
+            and same_low_impact_repeats >= cfg.MAX_CONSECUTIVE_LOW_IMPACT_REPEATS
+        ):
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    generate_response_fn,
+                    model=agent.model,
+                    instructions=agent.system_prompt,
+                    input_text=input_text
+                    + "\nENFORCEMENT: Repeated low-impact action plan detected. Choose a different concrete UI action now (prefer click_index on a non-input interactive element).",
+                ),
+                timeout=cfg.LLM_TIMEOUT_SECONDS,
+            )
+            continue
+        if (
+            attempt == 0
+            and claimed_status == "in_progress"
+            and _is_none_like(claimed_needs)
+            and verification_only_actions
             and _last_agent_had_no_action_in_progress(state, agent.name)
         ):
             response = await asyncio.wait_for(
@@ -571,7 +889,7 @@ async def run_agent_cycle(state: RunState, agent: AgentState) -> Message:
     if (
         claimed_status == "in_progress"
         and _is_none_like(claimed_needs)
-        and not actions
+        and _is_verification_only_actions(actions)
         and _last_agent_had_no_action_in_progress(state, agent.name)
     ):
         claimed_status = "blocked"
@@ -590,6 +908,7 @@ async def run_agent_cycle(state: RunState, agent: AgentState) -> Message:
 
     executed_actions: list[Action] = []
     action_results: list[ExecutionResult] = []
+    observation_before_actions = observation
     if claimed_intent_key and claimed_intent_key in state.memory.done_intents and claimed_status != "done":
         alternate_key = _normalize_intent_key(claimed_intent)
         if not alternate_key or alternate_key == claimed_intent_key:
@@ -650,6 +969,21 @@ async def run_agent_cycle(state: RunState, agent: AgentState) -> Message:
                     continue
                 message_text = _set_coordination_field(message_text, "OUTPUT", value)
                 break
+        if _is_none_like(parse_coordination_fields(message_text).get("OUTPUT", "none")) and executed_actions:
+            state_changed_signal = False
+            for result in action_results:
+                if not result.success:
+                    continue
+                data = result.data or {}
+                if isinstance(data, dict) and data.get("state_changed") is True:
+                    state_changed_signal = True
+                    break
+            observation_after_actions = await agent.get_browser().build_observation()
+            if state_changed_signal or _has_meaningful_observation_delta(
+                observation_before_actions,
+                observation_after_actions,
+            ):
+                message_text = _set_coordination_field(message_text, "OUTPUT", "observed_state_transition")
     agent.add_action(executed_actions, action_results)
 
     return Message(
@@ -669,7 +1003,9 @@ async def worker(state: RunState, agent: AgentState, after_turn: Callable[[RunSt
         last_needs = last_fields.get("NEEDS", "")
         if last_status == "waiting" and not _is_none_like(last_needs):
             target = _find_dependency_target(state, last_needs)
-            if target and not _is_wait_dependency_resolved(state, target):
+            if _is_needed_by_waiting_peer(state, agent.name):
+                pass
+            elif target and not _is_wait_dependency_resolved(state, target):
                 if _should_break_wait_deadlock(state, agent.name):
                     pass
                 else:
