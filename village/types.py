@@ -1,6 +1,6 @@
 import asyncio
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, InitVar
 import village.config as cfg
 import time
 import enum
@@ -31,13 +31,57 @@ class AgentConfig:
 
 @dataclass
 class AgentState:
-    config: AgentConfig
+    """
+    Runtime state for a single agent.
+
+    ``config`` is an init-only parameter (``InitVar``) — it is never stored as
+    a public attribute.  All config values are exposed through explicit
+    properties (``name``, ``provider``, ``model``, ``system_prompt``), which
+    are the only intended access points.  Internal code that needs the raw
+    config object can use ``self._config``.
+    """
+
+    # InitVar: accepted by __init__ but not stored as an instance attribute.
+    # Callers still write:  AgentState(config=my_config)
+    config: InitVar[AgentConfig]
+
+    # Non-init fields populated in __post_init__
+    _config: AgentConfig = field(init=False, repr=False)
     browser: BrowserEnvironment = field(init=False)
     actions: list[tuple[list[Action], list[ExecutionResult]]] = field(default_factory=list)
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, config: AgentConfig) -> None:
+        self._config = config
         self.browser = BrowserEnvironment(headless=True)
-    
+
+    # ------------------------------------------------------------------
+    # Public API — always go through these rather than _config directly
+    # ------------------------------------------------------------------
+
+    @property
+    def name(self) -> str:
+        """Agent's display name."""
+        return self._config.name
+
+    @property
+    def provider(self) -> cfg.Provider:
+        """LLM provider enum value."""
+        return self._config.provider
+
+    @property
+    def model(self) -> str:
+        """Model identifier string passed to the provider."""
+        return self._config.model
+
+    @property
+    def system_prompt(self) -> str:
+        """Full system prompt text for this agent."""
+        return self._config.system_prompt
+
+    # ------------------------------------------------------------------
+    # Browser helpers
+    # ------------------------------------------------------------------
+
     async def launch_browser(self) -> None:
         await self.browser.launch()
 
@@ -47,28 +91,16 @@ class AgentState:
     async def close_browser(self) -> None:
         if self.browser:
             await self.browser.close()
-        
+
+    # ------------------------------------------------------------------
+    # Action history
+    # ------------------------------------------------------------------
+
     def add_action(self, actions: list[Action], results: list[ExecutionResult]) -> None:
         self.actions.append((actions, results))
-    
+
     def get_last_action(self) -> tuple[list[Action], list[ExecutionResult]]:
         return self.actions[-1] if self.actions else ([], [])
-
-    @property
-    def name(self) -> str:
-        return self.config.name
-
-    @property
-    def provider(self) -> cfg.Provider:
-        return self.config.provider
-
-    @property
-    def model(self) -> str:
-        return self.config.model
-
-    @property
-    def system_prompt(self) -> str:
-        return self.config.system_prompt
 
 @dataclass
 class Message:
@@ -130,6 +162,25 @@ class SharedMemory:
     failure_counts: dict[str, int] = field(default_factory=dict)
     last_status_by_agent: dict[str, str] = field(default_factory=dict)
     summary: str = ""
+
+    def record_event(
+        self,
+        *,
+        agent: str,
+        event_type: str,
+        turn: int,
+        intent: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self.events.append(
+            MemoryEvent(
+                agent=agent,
+                event_type=event_type,
+                turn=turn,
+                intent=intent or "unspecified",
+                details=details or {},
+            )
+        )
 
     def get_snapshot(
         self,
