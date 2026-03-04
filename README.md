@@ -25,7 +25,7 @@ Agents coordinate through a small set of fields: `intent_key`, `status`, `output
 **1. Clone and create a virtual environment**
 
 ```bash
-git clone [https://github.com/your-username/mini-ai-village.git](https://github.com/vladakozachok/mini-ai-village.git)
+git clone https://github.com/vladakozachok/mini-ai-village.git
 cd mini-ai-village
 python3.12 -m venv .venv
 source .venv/bin/activate
