@@ -4,9 +4,9 @@
 
 Inspired by [AI Village](https://aivillage.org).
 
-Mini AI Village is a multi-agent system where two agents work together to achieve a common goal set by a human. Each agent has access to its won browser, task ownership and a communication chanel with the other agent. For clarity, agents communicate through a structured JSON protocol.
+Mini AI Village is a multi-agent system where two agents work together to achieve a common goal set by a human. Each agent has access to its own browser, task ownership, and a communication channel with the other agent. For clarity, agents communicate through a structured JSON protocol.
 
-While this repo is designed for a variety of tasks and workflows, I am including a demonstration fo the two agents creating a chess game and playing against each other. The demonstration features two gemini-3-flash agents (model chosen because of its low cost), which admitedly are not great at chess. Nevertheless, I think the demo is a fun way to display the coordination between agents and their interactions with their browser environments. The demo can be found here: LINK TO REPO.
+While this repo is designed for a variety of tasks and workflows, I am including a demonstration of the two agents creating a chess game and playing against each other. The demonstration features two gemini-flash-3 agents (model chosen because of its low cost), which admittedly are not great at chess. Nevertheless, I think the demo is a fun way to display the coordination between agents and their interactions with their browser environments. The demo can be found here: [DEMO](https://mini-ai-village-demo.vercel.app/).
 
 ## How it works
 
@@ -18,7 +18,7 @@ Each turn follows a fixed loop:
 4. Shared memory is updated with the new intent state, outputs, and dependency changes.
 5. Other agents wake up when ownership changes or a dependency resolves.
 
-Agents coordinate through a small set of fields: `intent_key`, `status`, `output`, and `needs`. Ownership, waiting, dependency tracking, and stall detection are all handled by the runtime, the model just reports what it's doing and what it needs.
+Agents coordinate through a small set of fields: `intent_key`, `status`, `output`, and `needs`. Ownership, waiting, dependency tracking, and stall detection are all handled by the runtime — the model just reports what it's doing and what it needs.
 
 ## Setup
 
@@ -44,7 +44,7 @@ python -m playwright install chromium
 cp .env.example .env
 ```
 
-Open `.env` and add your API key. The default model is `gemini-3-flash-preview`, so you need:
+Open `.env` and add your API key. The default model is `gemini-flash-3-preview`, so you need:
 
 ```
 GEMINI_API_KEY=your-key-here
@@ -79,9 +79,10 @@ The runtime handles ordinary browser collaboration well. Some interesting common
 - Research options on one site while the other agent verifies details on another
 
 ## Next Steps
+
 - Improve browser observation and interaction.
 - Support 3+ agents.
 - Run less structured collaboration tasks.
 - Add checkpoints so that a crashed run can be resolved.
 - Experiment with more complex LLMs.
-- Clean up an publish test suite.
+- Clean up and publish test suite.
