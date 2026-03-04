@@ -44,13 +44,13 @@ python -m playwright install chromium
 cp .env.example .env
 ```
 
-Open `.env` and add your API key. The default model is `gemini-2.0-flash`, so you need:
+Open `.env` and add your API key. The default model is `gemini-3-flash-preview`, so you need:
 
 ```
 GEMINI_API_KEY=your-key-here
 ```
 
-To use OpenAI or Deepseek instead, update the `AGENTS` list in `prompts.py` and set the corresponding key:
+To use OpenAI or Deepseek instead, update the `AGENTS` list in `config.py` and set the corresponding key:
 
 ```
 OPENAI_API_KEY=your-key-here
