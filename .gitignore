@@ -20,6 +20,7 @@ ENV/
 # Environment and local secrets
 .env
 .env.*
+!.env.example
 *.local
 
 # Build / packaging artifacts

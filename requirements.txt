@@ -1,0 +1,6 @@
+fastapi
+google - genai
+openai
+Pillow
+playwright
+pydantic

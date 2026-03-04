@@ -11,8 +11,8 @@ def _get_client() -> genai.Client:
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("Missing GEMINI_API_KEY environment variable.")
-    
     return genai.Client(api_key=api_key)
+
 
 def generate_response(
     *,
@@ -36,13 +36,14 @@ def generate_response(
         ]
 
     response = client.models.generate_content(
-        model=model, 
+        model=model,
         contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=instructions,
             thinking_config=types.ThinkingConfig(thinking_level="low"),
             temperature=temperature,
             max_output_tokens=max_output_tokens,
+            response_mime_type="application/json",
         ),
     )
 

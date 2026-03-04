@@ -1,11 +1,6 @@
-"""
-scheduling.py
--------------
-Agent coordination logic: deadlock detection, dependency tracking,
-turn-gate decisions, and enforcement policy.
-No async, no browser interaction.
-"""
+import logging
 from collections import Counter
+from dataclasses import dataclass, field
 from typing import Callable
 
 import village.config as cfg
@@ -17,44 +12,26 @@ from village.coordination import (
     _set_coordination_field,
     parse_coordination_fields,
 )
-from village.memory_ops import (
-    _dependency_is_resolved,
-    last_messages_for_each_agent,
-)
+from village.memory_ops import _dependency_is_resolved
 from village.agent_web_use_orchestration.browser_ops import (
     _action_signature,
     _is_low_impact_actions,
 )
 
-
-# ---------------------------------------------------------------------------
-# Intent ownership
-# ---------------------------------------------------------------------------
-
-def find_active_intent_owner_by_key(state: RunState, intent_key: str, exclude_agent: str) -> str | None:
-    if not intent_key:
-        return None
-    latest = last_messages_for_each_agent(state)
-    for speaker, fields in latest.items():
-        if speaker == exclude_agent:
-            continue
-        status = _normalize_text(fields.get("STATUS", ""))
-        claimed_key = _get_intent_key_from_fields(fields)
-        if status == "in_progress" and claimed_key == intent_key:
-            return fields.get("OWNER") or speaker
-    return None
+logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Dependency targeting
-# ---------------------------------------------------------------------------
+def find_active_intent_owner_by_key(
+    state: RunState, intent_key: str, exclude_agent: str
+) -> str | None:
+    return state.memory.get_active_owner(intent_key, exclude=exclude_agent)
+
 
 def _mentioned_agents_in_needs(state: RunState, needs: str) -> list[str]:
     if _is_none_like(needs):
         return []
     lowered = needs.lower()
-    mentioned = [agent.name for agent in state.agents if agent.name.lower() in lowered]
-    return sorted(set(mentioned))
+    return sorted({a.name for a in state.agents if a.name.lower() in lowered})
 
 
 def _find_dependency_target(state: RunState, needs: str) -> str | None:
@@ -72,15 +49,9 @@ def _wait_dependency_resolved(
     if target is None:
         return True
 
-    # Engine-generated ownership waits should clear as soon as the target is
-    # no longer actively holding the same intent, even if they did not mark it
-    # done. Otherwise a released owner can sit in STATUS=waiting and still keep
-    # the next agent asleep forever.
     if "active ownership of this intent" in needs.lower():
-        latest = last_messages_for_each_agent(state).get(target, {})
-        target_intent_key = _get_intent_key_from_fields(latest)
-        target_status = _normalize_text(latest.get("STATUS", ""))
-        if target_intent_key != (intent_key or "unspecified") or target_status != "in_progress":
+        owner = state.memory.get_active_owner(intent_key, exclude="")
+        if owner != target:
             return True
 
     tracked = [
@@ -98,9 +69,9 @@ def _wait_dependency_resolved(
         if msg.speaker != agent_name or msg.turn is None:
             continue
         fields = parse_coordination_fields(msg.message)
-        if _normalize_text(fields.get("STATUS", "")) != "waiting":
+        if _normalize_text(fields.get("status", "")) != "waiting":
             continue
-        if target not in _mentioned_agents_in_needs(state, fields.get("NEEDS", "")):
+        if target not in _mentioned_agents_in_needs(state, fields.get("needs", "")):
             continue
         since_turn = msg.turn
         break
@@ -115,64 +86,83 @@ def _wait_dependency_resolved(
     return _dependency_is_resolved(state, fallback)
 
 
-# ---------------------------------------------------------------------------
-# Peer wait / deadlock detection
-# ---------------------------------------------------------------------------
-
 def _is_needed_by_peer(state: RunState, agent_name: str) -> bool:
-    latest = last_messages_for_each_agent(state)
-    for speaker, fields in latest.items():
-        if speaker == agent_name:
+    for rec in state.memory.intents.values():
+        if rec.owner == agent_name:
             continue
-        needs = fields.get("NEEDS", "")
+        if state.memory.last_intent_key_by_agent.get(rec.owner) != rec.intent_key:
+            continue
+        if rec.status not in {"waiting", "blocked", "done"}:
+            continue
+        needs = rec.needs or ""
         if _is_none_like(needs):
             continue
-        if agent_name in _mentioned_agents_in_needs(state, needs):
+        if agent_name not in _mentioned_agents_in_needs(state, needs):
+            continue
+        dep = Dependency(
+            from_agent=rec.owner,
+            to_agent=agent_name,
+            intent=rec.intent_key or "unspecified",
+            since_turn=rec.turn_completed or rec.turn_claimed or 0,
+            reason=needs[:200],
+        )
+        if not _dependency_is_resolved(state, dep):
             return True
+    return False
+
+
+def _peer_progress_since_done(state: RunState, agent_name: str) -> bool:
+    from village.memory_ops import _last_agent_done_turn
+
+    done_turn = _last_agent_done_turn(state, agent_name)
+    if done_turn <= 0:
+        return False
+
+    for msg in reversed(state.messages):
+        if msg.turn is None:
+            continue
+        if msg.turn <= done_turn:
+            break
+        if msg.speaker == agent_name:
+            continue
+        return True
+
     return False
 
 
 def _deadlock_breaker_leader(state: RunState) -> str | None:
     statuses = state.memory.last_status_by_agent
-
-    # Only fire if every registered agent has reported in and all are waiting.
-    # Absent agents haven't started yet — they are not waiting.
     all_agent_names = {a.name for a in state.agents}
+
     if not all_agent_names.issubset(statuses.keys()):
         return None
     if not all(statuses[name] == "waiting" for name in all_agent_names):
         return None
 
-    # Prefer the agent most-needed by unresolved dependencies.
     unresolved_targets = [
-        dep.to_agent for dep in state.memory.dependencies
+        dep.to_agent
+        for dep in state.memory.dependencies
         if not _dependency_is_resolved(state, dep)
     ]
     if unresolved_targets:
         counts = Counter(unresolved_targets)
         return sorted(counts.keys(), key=lambda name: (-counts[name], name))[0]
 
-    # Fall back to the most recent message with a concrete NEEDS.
     for msg in reversed(state.messages):
         fields = parse_coordination_fields(msg.message)
         if not fields:
             continue
-        needs = fields.get("NEEDS", "")
+        needs = fields.get("needs", "")
         if _is_none_like(needs):
             continue
         mentioned = _mentioned_agents_in_needs(state, needs)
         if len(mentioned) == 1:
             return mentioned[0]
         if len(mentioned) > 1:
-            idx = state.next_turn % len(mentioned)
-            return mentioned[idx]
+            return mentioned[state.next_turn % len(mentioned)]
 
     return sorted(statuses.keys())[0]
 
-
-# ---------------------------------------------------------------------------
-# Waiting status resolution
-# ---------------------------------------------------------------------------
 
 def _resolve_waiting_status(
     state: RunState,
@@ -181,14 +171,6 @@ def _resolve_waiting_status(
     claimed_needs: str,
     message_text: str,
 ) -> tuple[str, str]:
-    """
-    Evaluate whether a 'waiting' status should be overridden to 'in_progress'.
-    Returns the (possibly updated) status string and message_text.
-
-    Side-effect: when a genuine unresolved dependency is detected it is persisted
-    into state.memory.dependencies so that deadlock detection and
-    _wait_dependency_resolved can find it on future turns.
-    """
     next_message: str | None = None
 
     if not _is_none_like(claimed_needs):
@@ -198,18 +180,15 @@ def _resolve_waiting_status(
                 from_agent=agent.name,
                 to_agent=target,
                 intent=claimed_intent_key or "unspecified",
-                since_turn=state.next_turn,
+                since_turn=state.next_turn + 1,
                 reason=claimed_needs[:200],
             )
             if _dependency_is_resolved(state, dep):
-                # Dependency already satisfied — clear the wait and move on.
                 message_text = _set_coordination_field(message_text, "NEEDS", "none")
-                next_message = "Dependency resolved; proceed with the next concrete step."
+                next_message = (
+                    "Dependency resolved; proceed with the next concrete step."
+                )
             else:
-                # Dependency is real and unresolved — persist it so that
-                # _deadlock_breaker_leader can weight it correctly and
-                # _wait_dependency_resolved sees it on future turns.
-                # Avoid duplicates.
                 already_tracked = any(
                     d.from_agent == agent.name
                     and d.to_agent == target
@@ -218,15 +197,13 @@ def _resolve_waiting_status(
                 )
                 if not already_tracked:
                     state.memory.dependencies.append(dep)
-        # If needs is set but names no known agent, allow waiting to stand.
-        # Fall through with next_message=None → status stays "waiting".
 
     elif _is_needed_by_peer(state, agent.name):
-        next_message = "Another agent explicitly needs you; perform a concrete action now."
+        next_message = (
+            "Another agent explicitly needs you; perform a concrete action now."
+        )
     elif _deadlock_breaker_leader(state) == agent.name:
         next_message = "Deadlock breaker: proceed with the next concrete step."
-    # No else: an agent that says STATUS: waiting with no NEEDS and no waiting peers
-    # is allowed to stay waiting — it may be pausing intentionally before re-checking.
 
     if next_message is not None:
         message_text = _set_coordination_field(message_text, "STATUS", "in_progress")
@@ -236,31 +213,12 @@ def _resolve_waiting_status(
     return "waiting", message_text
 
 
-# ---------------------------------------------------------------------------
-# Consecutive-turn pattern detection
-# ---------------------------------------------------------------------------
-
-def _last_agent_had_no_action_in_progress(state: RunState, agent_name: str) -> bool:
-    """Returns True if the agent's most recent in-progress turn had no concrete actions."""
-    for message in reversed(state.messages):
-        if message.speaker != agent_name:
-            continue
-        fields = parse_coordination_fields(message.message)
-        if not fields:
-            return False
-        if _normalize_text(fields.get("STATUS", "")) != "in_progress":
-            return False
-        return _is_low_impact_actions(message.actions, strict=True)
-    return False
-
-
 def _consecutive_turns_matching(
     state: RunState,
     agent_name: str,
     intent_key: str,
     predicate: Callable[[Message], bool],
 ) -> int:
-    """Count consecutive recent in-progress turns for agent+intent where predicate holds."""
     if not intent_key:
         return 0
     count = 0
@@ -272,7 +230,7 @@ def _consecutive_turns_matching(
             continue
         if _get_intent_key_from_fields(fields) != intent_key:
             break
-        if _normalize_text(fields.get("STATUS", "")) != "in_progress":
+        if _normalize_text(fields.get("status", "")) != "in_progress":
             break
         if predicate(message):
             count += 1
@@ -281,10 +239,15 @@ def _consecutive_turns_matching(
     return count
 
 
-def _consecutive_verification_turns_for_intent(state: RunState, agent_name: str, intent_key: str) -> int:
-    """Count consecutive in-progress turns where the agent only used get_value (or no actions)."""
+def _consecutive_verification_turns_for_intent(
+    state: RunState,
+    agent_name: str,
+    intent_key: str,
+) -> int:
     return _consecutive_turns_matching(
-        state, agent_name, intent_key,
+        state,
+        agent_name,
+        intent_key,
         lambda msg: _is_low_impact_actions(msg.actions, strict=True),
     )
 
@@ -295,12 +258,13 @@ def _consecutive_same_low_impact_plan_for_intent(
     intent_key: str,
     current_actions: list,
 ) -> int:
-    """Count consecutive in-progress turns where the agent repeated the exact same low-impact action plan."""
     if not intent_key or not _is_low_impact_actions(current_actions):
         return 0
     current_sig = [_action_signature(a) for a in current_actions]
     return _consecutive_turns_matching(
-        state, agent_name, intent_key,
+        state,
+        agent_name,
+        intent_key,
         lambda msg: (
             _is_low_impact_actions(msg.actions)
             and [_action_signature(a) for a in msg.actions] == current_sig
@@ -308,62 +272,152 @@ def _consecutive_same_low_impact_plan_for_intent(
     )
 
 
-# ---------------------------------------------------------------------------
-# Enforcement policy
-# ---------------------------------------------------------------------------
+def _message_had_noop_ui_attempt(msg: Message) -> bool:
+    if not msg.actions or not msg.action_results:
+        return False
 
-def _enforce_verification_cap(
-    *, claimed_status, claimed_needs, has_actionable_elements,
-    verification_only_actions, consecutive_verification_turns, **_
+    saw_ui_action = False
+    for action, result in zip(msg.actions, msg.action_results):
+        action_type = action.type.value
+        if action_type not in {"click", "click_index", "click_relative", "navigate"}:
+            continue
+        saw_ui_action = True
+        if not result.success:
+            return False
+        if not isinstance(result.data, dict):
+            return False
+        if result.data.get("state_changed") is not False:
+            return False
+    return saw_ui_action
+
+
+def _consecutive_noop_ui_turns_for_intent(
+    state: RunState,
+    agent_name: str,
+    intent_key: str,
+) -> int:
+    return _consecutive_turns_matching(
+        state,
+        agent_name,
+        intent_key,
+        _message_had_noop_ui_attempt,
+    )
+
+
+def _last_turn_had_screenshot_for_intent(
+    state: RunState,
+    agent_name: str,
+    intent_key: str,
 ) -> bool:
-    return (
-        claimed_status == "in_progress"
-        and _is_none_like(claimed_needs)
-        and has_actionable_elements
-        and verification_only_actions
-        and consecutive_verification_turns >= cfg.MAX_CONSECUTIVE_VERIFICATION_TURNS
+    if not intent_key:
+        return False
+    for message in reversed(state.messages):
+        if message.speaker != agent_name:
+            continue
+        fields = parse_coordination_fields(message.message)
+        if _get_intent_key_from_fields(fields) != intent_key:
+            continue
+        return any(action.type.value == "screenshot" for action in message.actions)
+    return False
+
+
+@dataclass
+class EnforcementContext:
+    needed_by_peer: bool
+    consecutive_verification_turns: int
+    same_low_impact_repeats: int
+    consecutive_noop_ui_turns: int
+    has_actionable_elements: bool
+    last_turn_had_screenshot: bool = False
+
+    claimed_status: str = "in_progress"
+    claimed_needs: str = "none"
+    verification_only_actions: bool = False
+    actions: list = field(default_factory=list)
+
+
+def build_enforcement_context(
+    *,
+    state: RunState,
+    agent_name: str,
+    intent_key: str,
+    observation: dict,
+) -> EnforcementContext:
+    from village.agent_web_use_orchestration.browser_ops import _has_actionable_elements
+
+    return EnforcementContext(
+        needed_by_peer=_is_needed_by_peer(state, agent_name),
+        consecutive_verification_turns=_consecutive_verification_turns_for_intent(
+            state=state,
+            agent_name=agent_name,
+            intent_key=intent_key,
+        ),
+        same_low_impact_repeats=_consecutive_same_low_impact_plan_for_intent(
+            state=state,
+            agent_name=agent_name,
+            intent_key=intent_key,
+            current_actions=[],
+        ),
+        consecutive_noop_ui_turns=_consecutive_noop_ui_turns_for_intent(
+            state=state,
+            agent_name=agent_name,
+            intent_key=intent_key,
+        ),
+        has_actionable_elements=_has_actionable_elements(observation),
+        last_turn_had_screenshot=_last_turn_had_screenshot_for_intent(
+            state=state,
+            agent_name=agent_name,
+            intent_key=intent_key,
+        ),
     )
 
 
-def _enforce_waiting_peer(*, claimed_status, needed_by_peer, actions, **_) -> bool:
-    return (
-        claimed_status == "in_progress"
-        and needed_by_peer
-        and _is_low_impact_actions(actions)
-    )
+def enforcement_prompt_hint(ctx: EnforcementContext) -> str | None:
+    if (
+        ctx.has_actionable_elements
+        and ctx.consecutive_noop_ui_turns >= cfg.MAX_CONSECUTIVE_NOOP_UI_TURNS
+    ):
+        lead = "Another agent is waiting on you. " if ctx.needed_by_peer else ""
+        if ctx.last_turn_had_screenshot:
+            return (
+                f"\nENFORCEMENT GUIDANCE: {lead}Your last {ctx.consecutive_noop_ui_turns} concrete UI turns "
+                "did not complete the task, and you already took a screenshot on the previous turn. "
+                "Do not take another screenshot yet. Use the current page state to choose a different "
+                "concrete action now."
+            )
+        return (
+            f"\nENFORCEMENT GUIDANCE: {lead}Your last {ctx.consecutive_noop_ui_turns} concrete UI turns "
+            "did not change page state. Do not repeat the same click target or coordinates. "
+            "If the page is ambiguous, take one screenshot first, then use it to choose a different "
+            "concrete action in the same turn."
+        )
 
+    if ctx.has_actionable_elements and ctx.needed_by_peer:
+        return (
+            "\nENFORCEMENT GUIDANCE: Another agent is waiting on you. "
+            "You must make concrete UI progress this turn. If the page is ambiguous, "
+            "you may take one screenshot first, but follow it with a different concrete "
+            "UI action in the same turn."
+        )
 
-def _enforce_low_impact_repeat(
-    *, claimed_status, claimed_needs, has_actionable_elements, same_low_impact_repeats, **_
-) -> bool:
-    return (
-        claimed_status == "in_progress"
-        and _is_none_like(claimed_needs)
-        and has_actionable_elements
-        and same_low_impact_repeats >= cfg.MAX_CONSECUTIVE_LOW_IMPACT_REPEATS
-    )
+    if (
+        ctx.has_actionable_elements
+        and ctx.consecutive_verification_turns >= cfg.MAX_CONSECUTIVE_VERIFICATION_TURNS
+    ):
+        return (
+            f"\nENFORCEMENT GUIDANCE: You have done {ctx.consecutive_verification_turns} "
+            "consecutive verification-only turns. You must perform at least one concrete "
+            "UI action this turn (prefer click_index)."
+        )
 
+    if (
+        ctx.has_actionable_elements
+        and ctx.same_low_impact_repeats >= cfg.MAX_CONSECUTIVE_LOW_IMPACT_REPEATS
+    ):
+        return (
+            f"\nENFORCEMENT GUIDANCE: You have repeated the same low-impact action "
+            f"{ctx.same_low_impact_repeats} times. Choose a different concrete UI action "
+            "(prefer click_index on a non-input interactive element)."
+        )
 
-# Ordered list of (predicate, enforcement_message). First match wins.
-_ENFORCEMENT_CHECKS: list[tuple] = [
-    (
-        _enforce_verification_cap,
-        "\nENFORCEMENT: Verification-only cap reached. Perform at least one concrete UI action now (prefer click_index).",
-    ),
-    (
-        _enforce_waiting_peer,
-        "\nENFORCEMENT: Another agent explicitly needs you. Take a concrete UI action now (not just monitoring/chat/get_value).",
-    ),
-    (
-        _enforce_low_impact_repeat,
-        "\nENFORCEMENT: Repeated low-impact action plan detected. Choose a different concrete UI action now (prefer click_index on a non-input interactive element).",
-    ),
-]
-
-
-def _get_enforcement_suffix(**ctx) -> str | None:
-    """Return the enforcement suffix for a retry, or None if no retry is needed."""
-    for predicate, message in _ENFORCEMENT_CHECKS:
-        if predicate(**ctx):
-            return message
     return None
